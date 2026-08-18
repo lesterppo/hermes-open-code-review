@@ -1,58 +1,61 @@
 #!/usr/bin/env bash
 # install.sh — idempotent installer for hermes-open-code-review
-# Copies the native ocr tool + skill into a Hermes Agent installation.
+# Installs the native ocr tool + skill into the local-tools plugin dir
+# (~/.hermes/plugins/hermes_local_tools/) so `hermes update` never wipes them.
 #
 # Usage:
-#   ./install.sh ~/.hermes/hermes-agent
-#   ./install.sh /path/to/hermes-agent
+#   ./install.sh
+#   ./install.sh ~/.hermes/plugins/hermes_local_tools   # explicit plugin dir
 #
 # Requires: ocr CLI (npm i -g @alibaba-group/open-code-review)
 
 set -euo pipefail
 
-HERMES_AGENT="${1:-$HOME/.hermes/hermes-agent}"
-if [ ! -d "$HERMES_AGENT/tools" ]; then
-    echo "ERROR: $HERMES_AGENT/tools not found. Is this a Hermes Agent installation?"
-    exit 1
-fi
-
+PLUGIN_DIR="${1:-$HOME/.hermes/plugins/hermes_local_tools}"
 SKILL_DIR="$HOME/.hermes/skills/devops/ocr-code-review"
 
-echo "=== hermes-open-code-review installer ==="
-echo "Target: $HERMES_AGENT"
+echo "=== hermes-open-code-review installer (v2) ==="
+echo "Plugin target: $PLUGIN_DIR"
 echo ""
 
-# 1. Copy native tool
+# 1. Copy native tool into the plugin
+if [ ! -d "$PLUGIN_DIR" ]; then
+    echo "ERROR: $PLUGIN_DIR not found. Is the hermes_local_tools plugin installed?"
+    echo "Create it with: mkdir -p $PLUGIN_DIR (then add a plugin.yaml)"
+    exit 1
+fi
 echo "[1/3] Installing native tool..."
-cp -v tools/ocr_tool.py "$HERMES_AGENT/tools/ocr_tool.py"
+cp -v tools/ocr_tool.py "$PLUGIN_DIR/ocr_tool.py"
 
-# 2. Copy skill
-echo "[2/3] Installing skill..."
+# 2. Ensure the plugin registers the ocr tool (idempotent)
+echo "[2/3] Ensuring plugin registration..."
+INIT="$PLUGIN_DIR/__init__.py"
+if [ -f "$INIT" ]; then
+    if ! grep -q "ocr_tool" "$INIT"; then
+        echo "  → WARNING: '$INIT' does not import ocr_tool."
+        echo "    Add to the import block:"
+        echo "        ocr_tool,"
+        echo "    and to _TOOLS:"
+        echo '        ("ocr", "code_review"),'
+    else
+        echo "  ✓ ocr_tool already registered in __init__.py"
+    fi
+else
+    echo "  → Note: no __init__.py in plugin dir; the tool file still"
+    echo "    self-registers via registry.register() on import."
+fi
+
+# 3. Copy skill
+echo "[3/3] Installing skill..."
 mkdir -p "$SKILL_DIR"
 cp -v skills/ocr-code-review/SKILL.md "$SKILL_DIR/SKILL.md"
-
-# 3. Wire into toolsets.py
-echo "[3/3] Checking toolsets.py wiring..."
-
-TOOLSETS="$HERMES_AGENT/toolsets.py"
-
-# Check if ocr is already in _HERMES_CORE_TOOLS
-if grep -q '"ocr"' "$TOOLSETS"; then
-    echo "  ✓ ocr already in _HERMES_CORE_TOOLS"
-else
-    echo "  → Add the following to _HERMES_CORE_TOOLS in $TOOLSETS:"
-    echo '    "ocr",  # AI code review via alibaba/open-code-review'
-    echo ""
-    echo "  → And add the code_review toolset to TOOLSETS dict:"
-    echo '    "code_review": {'
-    echo '        "description": "AI code review via alibaba/open-code-review (OCR).",'
-    echo '        "tools": ["ocr"],'
-    echo '        "includes": []'
-    echo '    },'
-fi
 
 echo ""
 echo "=== Done ==="
 echo "Restart Hermes to load the new tool."
+echo "The 'code_review' toolset auto-enables (plugin toolsets default to enabled)."
 echo "Verify with: ocr(action='version')"
 echo "Start a review: ocr(action='preview')"
+echo ""
+echo "If the toolset doesn't appear after restart, run:"
+echo "  hermes tools   # saves plugin toolset keys; then toggle code_review if needed"

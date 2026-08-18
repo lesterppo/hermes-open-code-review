@@ -8,14 +8,18 @@ configure, and use the `ocr` tool in a Hermes Agent installation.
 
 A Hermes Agent **native tool** that wraps the
 [alibaba/open-code-review](https://github.com/alibaba/open-code-review) CLI
-(`ocr` v1.8+). Two modes:
+(`ocr` v1.9+). Three groups:
 
 - **Delegation** (always available, no LLM needed on OCR side): `preview` +
-  `rule` actions for deterministic file selection and rule resolution. The
-  Hermes agent performs the review using its own LLM. **Live-tested Jul 2026**
-  against intentional bugs — found all 9 issues correctly.
+  `rule` + `rules_check` actions for deterministic file selection and rule
+  resolution. The Hermes agent performs the review using its own LLM.
+  **Live-tested Jul/Aug 2026** against intentional bugs — found all issues
+  correctly with severity classification.
 - **Direct** (needs OCR LLM config): `review` and `scan` actions for full
-  AI-powered review with line-level comments and fix suggestions.
+  AI-powered review with line-level comments, fix suggestions, json or SARIF
+  output, resume, and token budgets.
+- **Utility**: `session_list`, `session_view`, `session_comments`,
+  `llm_test`, `llm_providers`, `version`.
 
 ## Quick start (for an AI agent integrating this)
 
@@ -23,37 +27,23 @@ A Hermes Agent **native tool** that wraps the
 # 1. Install OCR CLI
 npm install -g @alibaba-group/open-code-review
 
-# 2. Clone and install
+# 2. Clone and install (targets the local-tools plugin dir — survives
+#    `hermes update`; no core files modified)
 git clone https://github.com/lesterppo/hermes-open-code-review.git
 cd hermes-open-code-review
-./install.sh ~/.hermes/hermes-agent
+./install.sh
 ```
 
-Then wire `"ocr"` into `_HERMES_CORE_TOOLS` in `toolsets.py`:
+The `ocr` tool registers via `registry.register(name="ocr", toolset="code_review", ...)`
+and the plugin `~/.hermes/plugins/hermes_local_tools/__init__.py` re-registers
+it through `ctx.register_tool(...)`, which auto-enables the `code_review`
+toolset for all platforms (plugin toolsets default to enabled unless listed in
+`_DEFAULT_OFF_TOOLSETS` or explicitly disabled via `hermes tools`). Restart
+Hermes, then verify: `ocr(action='version')`.
 
-```python
-_HERMES_CORE_TOOLS = [
-    ...
-    "ocr",   # AI code review via alibaba/open-code-review
-]
-```
-
-And add the toolset:
-
-```python
-TOOLSETS = {
-    ...
-    "code_review": {
-        "description": "AI code review via alibaba/open-code-review (OCR).",
-        "tools": ["ocr"],
-        "includes": []
-    },
-    ...
-}
-```
-
-Restart Hermes. The tool is gated by `check_fn` — it only appears when the
-`ocr` binary is on PATH. Zero footprint otherwise.
+If a stale cache hides the toolset: `hermes tools` (saves the plugin toolset
+keys) or run `discover_plugins(force=True)` + `_persist_plugin_toolset_keys()`
+from a Python REPL with `PYTHONPATH=~/.hermes/hermes-agent`.
 
 ## Delegation workflow (proven recipe — live-tested)
 
@@ -73,13 +63,13 @@ ocr(action='preview', commit='abc123')
 ocr(action='preview')
 ```
 
-Response contains:
+Response `data` contains:
 - `mode`: workspace / range / commit
 - `from` / `to` / `merge_base`: for constructing git commands
-- `total_insertions` / `total_deletions`: diff size
-- List of files with status (`[M]` / `[A]` / `[D]`), +N/-N line counts
+- `nf` / `tot`: reviewable / total file counts; `ins` / `del`: line counts
+- `files`: `[{p, s, i, d}]` (path, status, insertions, deletions)
 
-**Extract `merge_base`** from the output for the git diff command in Step 3.
+**Extract `merge_base`** from `data` for the git diff command in Step 3.
 
 ### Step 2: Get review rules
 
@@ -87,18 +77,21 @@ Response contains:
 ocr(action='rule', files=['path/to/file1.py', 'path/to/file2.py'])
 ```
 
-Rules are grouped by content — files sharing identical rules appear under one
-group (OCR deduplicates to save tokens). System rules cover:
+- `data.groups`: compact group metadata `[{src, pat, fs, rule(truncated)}]`
+- `out` (or `@` if > 9000 chars): the FULL rule text — read it to guide the
+  review
+- `ocr(action='rules_check', file='src/app.py')` → which single rule applies
+  (File/Source/Pattern)
 
-- Python: MD5, pickle, bare except, mutable defaults, SQL injection, shell injection, exec/eval, timing attacks, identity comparisons, resource leaks
-- JavaScript/TypeScript: XSS, prototype pollution, eval, unsafe DOM, missing awaits
-- Java: NPE, thread safety, resource management, SQL injection
-- Go: error handling, goroutine leaks, nil pointer, race conditions
-- Rust: unsafe blocks, unwrap on Result/Option, deadlocks
-- C/C++: buffer overflow, use-after-free, null dereference, format string
-
-Rules output can be 8KB+ for comprehensive rulesets. Pass only the files you're
-reviewing to keep it manageable.
+System rules cover Python (MD5, pickle, bare except, mutable defaults, SQL
+injection, shell injection, exec/eval, timing attacks, identity comparisons,
+resource leaks), JavaScript/TypeScript (XSS, prototype pollution, eval, unsafe
+DOM, missing awaits), Java (NPE, thread safety, resource management, SQL
+injection), Go (error handling, goroutine leaks, nil pointer, race
+conditions), Rust (unsafe blocks, unwrap on Result/Option, deadlocks), C/C++
+(buffer overflow, use-after-free, null dereference, format string), plus
+Swift, R, Zig, Nim, Haskell, Elm, Jsonnet, Thrift, Cap'n Proto and more
+(v1.9.x language additions).
 
 ### Step 3: Get diffs
 
@@ -160,23 +153,28 @@ Report in structured markdown:
 - **`path/file:LINE`** — Description
 ```
 
-## Live test results (Jul 2026)
+## Live test results (Jul/Aug 2026)
 
-Tested against `ocr_tool.py` with 36 lines of intentionally buggy code
-appended. OCR correctly identified the file and matched Python rules. Hermes
-agent found all 9 issues:
+Tested against `ocr_tool.py` + a scratch repo with 36 lines of intentionally
+buggy code appended. OCR correctly identified the files and matched rules;
+DeepSeek V4 Flash review/scan found all intentional issues:
 
 | Issue | Severity | Correct |
 |-------|----------|---------|
-| `exec()` on arbitrary input | Critical | ✓ |
+| `exec()`/command injection on arbitrary input | Critical | ✓ |
 | MD5 for password hashing | Critical | ✓ |
 | SQL injection via f-string | Critical | ✓ |
 | Shell injection via shell=True | Critical | ✓ |
-| Bare except swallows errors | Critical | ✓ |
+| Pickle deserialization of untrusted data | Critical | ✓ |
+| Bare except swallows errors | High | ✓ |
 | Mutable default argument | High | ✓ |
-| Unused imports | High | ✓ |
-| Duplicate function-level imports | Medium | ✓ |
-| Dead code (unreachable functions) | Medium | ✓ |
+| Unused imports / dead code | High | ✓ |
+| String building in loop (`+=`) | Low/Medium | ✓ |
+| `== None` style | Low | ✓ |
+
+Full scan of the 2-file repo: 12 comments (3 critical, 2 high, 2 medium, 5
+low), 2m28s, 43k tokens — budget caps (`--max-tokens-budget`) and SARIF output
+verified live.
 
 ## Direct mode
 
@@ -187,33 +185,56 @@ ocr(action='review', from_ref='main', to_ref='feature-branch')
 # Full-file scan
 ocr(action='scan', path='internal/agent')
 
+# SARIF 2.1.0 (saved to disk; not allowed with preview=True)
+ocr(action='review', from_ref='main', to_ref='feature-branch', format='sarif')
+
 # Dry-run (no LLM, works without config)
 ocr(action='review', preview=True)
+
+# Resume + token budget + no post-filter
+ocr(action='review', from_ref='main', to_ref='feature-branch',
+    resume='<session-id>', max_tokens_budget=200000, no_filter=True)
+
+# Session forensics
+ocr(action='session_list', limit=20)
+ocr(action='session_view', session_id='<id>')
+ocr(action='session_comments', session_id='<id>', severity='critical,high',
+    category='bug,security')
 ```
 
 Direct mode returns compact JSON:
-- `nc`: comment count, `nf`: files reviewed, `sid`: session ID
-- `comments`: array of `{f, l, s, c, msg, fix}` (file, line range, severity, category, message, fix code)
+- `nf`: files reviewed, `nc`: comments, `toks`: {i,o,t,c} token counts
+- `sid`: session ID, `llm`: {provider, model}, `retries`, `tc`: tool calls
+- `budget`: true when a token budget stopped dispatch (plus `warns`)
+- `cmts`: `[{f, l, s, c, msg, fix, ex}]` (file, line range, severity,
+  category, message, fix code, existing code)
 - Full output saved to `~/.hermes/ocr_output/` (`@` key)
 
 Requires OCR LLM configured:
 ```bash
-ocr config provider    # interactive provider setup
-ocr config model       # pick a model
-ocr llm test           # verify connectivity
+ocr config set provider deepseek
+ocr config set model deepseek-v4-flash
+ocr config set providers.deepseek.api_key "$DEEPSEEK_API_KEY"
+# or interactive:
+ocr config provider
+ocr config model
+ocr llm test   # verify connectivity
 ```
 
 ## Action reference
 
 | Action | LLM needed? | Purpose |
 |--------|-------------|---------|
-| `preview` | No | File selection + mode/ref metadata |
+| `preview` | No | File selection + mode/ref metadata (JSON) |
 | `rule` | No | Matched review rules grouped by content |
-| `review` | Yes (no for `preview=True`) | Diff-based AI review |
-| `scan` | Yes (no for `preview=True`) | Full-file AI scan |
-| `session_list` | No | List saved review sessions |
+| `rules_check` | No | Which rule applies to one file path |
+| `review` | Yes (no for `preview=True`) | Diff-based AI review (json/sarif) |
+| `scan` | Yes (no for `preview=True`) | Full-file AI scan (json/sarif) |
+| `session_list` | No | List saved review sessions (compact) |
 | `session_view` | No | Inspect a session by ID |
-| `llm_test` | No | Check OCR LLM connectivity |
+| `session_comments` | No | Extract comments from a session (filters) |
+| `llm_test` | No | Live OCR LLM connectivity check |
+| `llm_providers` | No | List built-in LLM providers |
 | `version` | No | Show OCR CLI version |
 
 ## Output format (compact, token-efficient)
@@ -226,45 +247,46 @@ All responses use short keys:
 | `e` | Error message |
 | `h` | Hint (how to fix) |
 | `out` | Raw stdout (truncated, full at `@`) |
-| `err` | stderr |
+| `err` | stderr / failure reason |
 | `@` | Saved file path for full output |
 | `code` | Exit code |
-| `nc` | Comment count (direct mode) |
-| `nf` | Files reviewed (direct mode) |
-| `sid` | Session ID (direct mode) |
+| `data` | Compact structured result (mode/files/groups/comments...) |
+| `n` | Count (sessions, comments, providers) |
+| `sid` | Session ID |
 | `_action` | Which action ran |
 
 ## Configuring LLM for direct mode
 
-OCR supports OpenAI and Anthropic-compatible endpoints:
+OCR supports OpenAI and Anthropic-compatible endpoints; 25+ built-in
+providers (deepseek, anthropic, openai, xai, kimi-global, siliconflow,
+mistral, novita, dashscope, minimax, z-ai, ... — `ocr(action='llm_providers')`):
 
 ```bash
-# Interactive (recommended)
-ocr config provider
-ocr config model
-
 # Environment variables (CI)
-export OCR_LLM_URL=https://api.anthropic.com/v1/messages
+export OCR_LLM_URL=https://api.openai.com/v1/chat/completions
 export OCR_LLM_TOKEN=sk-...
-export OCR_LLM_MODEL=claude-opus-4-6
-export OCR_USE_ANTHROPIC=true
+export OCR_LLM_MODEL=gpt-4o
+export OCR_USE_OPENAI=true
 
 # Direct config
-ocr config set llm.url https://api.openai.com/v1/chat/completions
-ocr config set llm.auth_token sk-...
-ocr config set llm.model gpt-4o
+ocr config set provider deepseek
+ocr config set model deepseek-v4-flash
+ocr config set providers.deepseek.api_key "$KEY"
 ```
 
-## Files
+Custom providers: `ocr config set provider my-gateway` +
+`ocr config set custom_providers.my-gateway.url ...` +
+`ocr config set custom_providers.my-gateway.protocol openai|anthropic`.
 
-```
-tools/ocr_tool.py              # Native tool (registry.register + dispatch)
-skills/ocr-code-review/SKILL.md  # Hermes skill (auto-loaded)
-install.sh                     # Idempotent installer
-```
+## Development
 
-## Privacy rules
-
-- No secrets, API keys, or personal paths in any committed file
-- All paths use `get_hermes_home()`, never `/home/*`
-- Repo is safe to fork and publicize
+- Canonical tool: `tools/ocr_tool.py` (v2, ~690 lines, Python stdlib only)
+- Runtime copy: `~/.hermes/plugins/hermes_local_tools/ocr_tool.py` — keep in
+  sync (`cp tools/ocr_tool.py ~/.hermes/plugins/hermes_local_tools/ocr_tool.py`)
+- Skill: `skills/ocr-code-review/SKILL.md` → also installed to
+  `~/.hermes/skills/devops/ocr-code-review/`
+- Test harness: standalone Python + `PYTHONPATH=~/.hermes/hermes-agent`, import
+  `ocr_tool`, exercise `ocr_tool(action=...)` against a scratch git repo with
+  intentional bugs (see Live test results)
+- Upstream CLI moves fast (v1.8 → v1.9.6 in ~3 weeks) — re-check `ocr --help`
+  per subcommand when updating
