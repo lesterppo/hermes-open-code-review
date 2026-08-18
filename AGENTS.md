@@ -285,6 +285,17 @@ Custom providers: `ocr config set provider my-gateway` +
   sync (`cp tools/ocr_tool.py ~/.hermes/plugins/hermes_local_tools/ocr_tool.py`)
 - Skill: `skills/ocr-code-review/SKILL.md` → also installed to
   `~/.hermes/skills/devops/ocr-code-review/`
+- **Plugin registration pattern (must be preserved):** the plugin
+  `~/.hermes/plugins/hermes_local_tools/__init__.py` imports each tool module
+  in a per-module `try/except` loop (`_TOOL_MODULES`) so one broken module
+  (syntax error, missing dep) degrades to "that tool missing" instead of
+  killing the whole plugin and its other 12 tools. It then re-registers each
+  tool via `ctx.register_tool(name, toolset, ...)` so the toolset
+  (`code_review`) auto-enables. NEVER revert to a plain `from . import (...)` 
+  block. Also: don't import the plugin package directly in a process that
+  calls `discover_plugins()` — the module-level `registry.register()` becomes
+  GLOBAL in that case and the plugin's scoped re-registration is correctly
+  rejected by the shadow guard (test artifact, not a bug).
 - Test harness: standalone Python + `PYTHONPATH=~/.hermes/hermes-agent`, import
   `ocr_tool`, exercise `ocr_tool(action=...)` against a scratch git repo with
   intentional bugs (see Live test results)
