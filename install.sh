@@ -14,7 +14,7 @@ set -euo pipefail
 PLUGIN_DIR="${1:-$HOME/.hermes/plugins/hermes_local_tools}"
 SKILL_DIR="$HOME/.hermes/skills/devops/ocr-code-review"
 
-echo "=== hermes-open-code-review installer (v2) ==="
+echo "=== hermes-open-code-review installer (v3, ocr CLI v1.12+) ==="
 echo "Plugin target: $PLUGIN_DIR"
 echo ""
 

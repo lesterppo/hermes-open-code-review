@@ -8,7 +8,7 @@ configure, and use the `ocr` tool in a Hermes Agent installation.
 
 A Hermes Agent **native tool** that wraps the
 [alibaba/open-code-review](https://github.com/alibaba/open-code-review) CLI
-(`ocr` v1.9+). Three groups:
+(`ocr` v1.12+). Three groups:
 
 - **Delegation** (always available, no LLM needed on OCR side): `preview` +
   `rule` + `rules_check` actions for deterministic file selection and rule
@@ -19,12 +19,14 @@ A Hermes Agent **native tool** that wraps the
   AI-powered review with line-level comments, fix suggestions, json or SARIF
   output, resume, and token budgets.
 - **Utility**: `session_list`, `session_view`, `session_comments`,
-  `llm_test`, `llm_providers`, `version`.
+  `session_compare` (new/persisting/resolved across two runs), `llm_test`,
+  `llm_providers`, `viewer` / `viewer_stop` (session-history WebUI),
+  `version`.
 
 ## Quick start (for an AI agent integrating this)
 
 ```bash
-# 1. Install OCR CLI
+# 1. Install OCR CLI (v1.12.2 or newer)
 npm install -g @alibaba-group/open-code-review
 
 # 2. Clone and install (targets the local-tools plugin dir — survives
@@ -182,6 +184,12 @@ verified live.
 # Diff-based review
 ocr(action='review', from_ref='main', to_ref='feature-branch')
 
+# Review effort preset (review-only in v1.12.x)
+ocr(action='review', from_ref='main', to_ref='feature-branch', effort='high')
+
+# Prompt/tool ceilings
+ocr(action='scan', path='internal/agent', max_tokens=6000, max_tools=60)
+
 # Full-file scan
 ocr(action='scan', path='internal/agent')
 
@@ -200,6 +208,13 @@ ocr(action='session_list', limit=20)
 ocr(action='session_view', session_id='<id>')
 ocr(action='session_comments', session_id='<id>', severity='critical,high',
     category='bug,security')
+
+# Did the fixes land? new / persisting / resolved between two runs
+ocr(action='session_compare', before_id='<older>', after_id='<newer>')
+
+# Session-history WebUI (detached; returns the URL) + stop
+ocr(action='viewer')
+ocr(action='viewer_stop')
 ```
 
 Direct mode returns compact JSON:
@@ -233,6 +248,9 @@ ocr llm test   # verify connectivity
 | `session_list` | No | List saved review sessions (compact) |
 | `session_view` | No | Inspect a session by ID |
 | `session_comments` | No | Extract comments from a session (filters) |
+| `session_compare` | No | Diff two sessions: new / persisting / resolved |
+| `viewer` | No | Start the session-history WebUI (detached, returns URL) |
+| `viewer_stop` | No | Stop a viewer started by this tool |
 | `llm_test` | No | Live OCR LLM connectivity check |
 | `llm_providers` | No | List built-in LLM providers |
 | `version` | No | Show OCR CLI version |
@@ -278,9 +296,68 @@ Custom providers: `ocr config set provider my-gateway` +
 `ocr config set custom_providers.my-gateway.url ...` +
 `ocr config set custom_providers.my-gateway.protocol openai|anthropic`.
 
+## v3 update (OCR CLI v1.12.2) — live-tested 2026-09-15
+
+Upstream moved v1.9.6 → v1.12.2 (~3 weeks). What changed on our side:
+
+| Area | v2 (CLI 1.9.6) | v3 (CLI 1.12.2) |
+|------|----------------|-----------------|
+| `review` flags | resume, budget, no-filter | + `--effort low\|medium\|high`, `--max-tokens`, `--max-tools`, `--max-git-procs`, `-o/--output` |
+| `scan` flags | batch, no-plan/summary/dedup | + `--max-tokens`, `--max-tools`, `--max-git-procs`, `-o/--output` |
+| Session diff | — | `session_compare` action (`ocr session compare`) |
+| Session WebUI | — | `viewer` / `viewer_stop` actions (`ocr viewer`) |
+| Output hygiene | raw stdout | `--color never` forced (auto-retry on old CLIs); `[ocr] Results written to …` chatter filtered out of `err` |
+| Token economy | thinking kept when parsing raw | `thinking` (model CoT, tens of KB) dropped by the compactor |
+
+Traps verified against the real CLI (do not "fix" these blindly):
+
+1. **`--effort` is review-only.** `ocr scan` rejects it with
+   `Error: unknown flag: --effort`. The tool returns a clear error instead of
+   silently dropping the parameter.
+2. **Budget-stop now exits 0** when partial results are published (v1.12 help:
+   "review exits 0; it exits non-zero only if every selected item failed").
+   The old skill note claiming a non-zero budget exit is outdated — the tool
+   reads `summary.budget_exceeded` + `warnings[]` regardless of exit code and
+   surfaces them as `data.budget` / `data.warns`.
+3. **`-o/--output` prints a status line to stderr** (`[ocr] Results written to
+   <path>`). The tool routes review/scan JSON through its own `-o` file and
+   re-reads it, then strips that line from `err` so it is not mistaken for a
+   failure.
+4. **`--color never` must be last-safe**: it is a global flag, accepted on
+   every subcommand; the runner retries without it if an older CLI rejects it.
+5. **Flag audit**: `scripts/flag_audit.py`-style check (see Live test below)
+   cross-checks every flag the tool can emit against `ocr <cmd> --help` for the
+   installed CLI — run it after every CLI upgrade.
+
+### Live test — v3 against CLI v1.12.2 (32/32 actions, 0 failures)
+
+Fixture: 2-commit git repo (`init` clean → `add buggy hash_pw` with shell
+injection, MD5 password hashing, bare except, mutable default). Every action
+exercised end-to-end against the real CLI + DeepSeek V4 Flash:
+
+| Action | Result |
+|--------|--------|
+| `version` | `open-code-review v1.12.2` |
+| `llm_providers` / `llm_test` | 2201B list / live 1.4s round-trip OK |
+| `preview` (range / commit / workspace) | merge_base correct; 1 reviewable file each |
+| `rule` / `rules_check` | rules returned (9020B) / source+pattern resolved |
+| `review` (range, effort=low) | **4 findings** — shell=True injection (critical), bare except (high), MD5 password hashing (critical), unused mutable default (medium); 11.6s |
+| `scan` (file) | 4 findings, 20.1s, tokens reported (i/o/t/c) |
+| `scan --format sarif` | valid SARIF **2.1.0**, 1 run, 4 results, 8030B |
+| `scan preview=True` | dry-run, no LLM |
+| `review --format text` | text report OK |
+| budget stop (`max_tokens_budget=300`) | `data.budget=true` + `warns[0].m="stopped in batch #0: used 0 tokens + next-file estimate exceeds budget 300"` |
+| `session_list/view/comments` | 5+ sessions; filters (`severity=critical,high`) honoured |
+| `session_compare` (review vs scan) | `persisting: 4`, `new: 0`, `resolved: 0` — real bucketing |
+| `viewer` / `viewer_stop` | detached, HTTP 200 on `http://localhost:5483`, idempotent re-start, clean stop |
+| error paths (8) | bad repo, bad format, resume-without-range, missing session id, rule without files, `effort` on scan, compare with one id, unknown action — all clear messages |
+
+Payload sizes confirm the token economy: review 2.4KB, scan 3.7KB, preview
+0.2-0.4KB, session_compare 2.8KB, schema 8.3KB.
+
 ## Development
 
-- Canonical tool: `tools/ocr_tool.py` (v2, ~690 lines, Python stdlib only)
+- Canonical tool: `tools/ocr_tool.py` (v3, ~870 lines, Python stdlib only)
 - Runtime copy: `~/.hermes/plugins/hermes_local_tools/ocr_tool.py` — keep in
   sync (`cp tools/ocr_tool.py ~/.hermes/plugins/hermes_local_tools/ocr_tool.py`)
 - Skill: `skills/ocr-code-review/SKILL.md` → also installed to

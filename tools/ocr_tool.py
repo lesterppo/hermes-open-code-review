@@ -1,6 +1,6 @@
-"""Open Code Review (OCR) v2 — AI-powered code review via `ocr` CLI.
+"""Open Code Review (OCR) v3 — AI-powered code review via `ocr` CLI.
 
-Wraps alibaba/open-code-review v1.9+ with three mode groups:
+Wraps alibaba/open-code-review v1.12+ with three mode groups:
 
   DELEGATION (always available, no LLM needed on OCR side):
     preview      — which files to review + mode/ref/merge_base metadata
@@ -13,17 +13,29 @@ Wraps alibaba/open-code-review v1.9+ with three mode groups:
     session_list     — list saved review sessions
     session_view     — inspect one session (files + comment counts)
     session_comments — extract comments from a saved session (filters)
+    session_compare  — diff two sessions (new / persisting / resolved)
 
   UTILITY:
     llm_test      — live OCR LLM connectivity check
     llm_providers — list built-in LLM providers
+    viewer        — start the local session-history WebUI (background)
+    viewer_stop   — stop a viewer started by this tool
     version       — OCR CLI version
 
-v2 changes (v1.9.6 CLI): delegate preview/rule now emit JSON (--format json);
-review/scan gained --resume, --max-tokens-budget, --no-filter, --batch,
---no-summary, sarif format; new `rules`, `session comments`, `llm providers`
-subcommands; files_reviewed moved into summary; scan/review summaries carry
-token counts + conditional budget_exceeded.
+v3 changes (CLI v1.12.x):
+  * review gained --effort (low|medium|high, review-only in v1.12.x).
+  * both gained --max-tokens (per-group prompt ceiling), --max-tools,
+    --max-git-procs, and -o/--output (the tool now routes the report
+    through its own -o file and re-reads it, keeping stdout compact).
+  * new `session compare` subcommand → `session_compare` action (new /
+    persisting / resolved findings between two runs).
+  * new `ocr viewer` WebUI → `viewer` / `viewer_stop` actions (detached,
+    prints the URL; never blocks the agent).
+  * `--color never` is forced on every invocation so stdout stays free of
+    ANSI escapes (auto-degrades on older CLIs without the flag).
+  * rule languages added upstream (Handlebars/Mustache/Pug, Verilog/
+    SystemVerilog/VHDL, Solidity/Vyper, OCaml/ReasonML, Rego, Objective-C,
+    MATLAB) — no tool change needed, rules come from the CLI.
 
 Output: compact 1-2 char keys. Large results saved to disk (@).
 Gated via check_fn on `ocr` binary presence.
@@ -32,8 +44,10 @@ Gated via check_fn on `ocr` binary presence.
 import json
 import os
 import shutil
+import signal
 import subprocess
 import time
+import urllib.request
 from pathlib import Path
 
 from tools.registry import registry
@@ -42,10 +56,12 @@ from tools.registry import registry
 
 MAX_INLINE_CHARS = 9000
 OCR_BIN = shutil.which("ocr") or "ocr"
-TIMEOUT_REVIEW = 900    # 15 min for review/scan (LLM runs)
+TIMEOUT_REVIEW = 1800   # 30 min for review/scan (LLM runs)
 TIMEOUT_DEFAULT = 60
+TOOL_VERSION = "3.0.0"
 OCR_CONFIG = Path.home() / ".opencodereview" / "config.json"
 _LLM_GATE_CACHE = {"mtime": 0.0, "ok": False}
+_EFFORTS = ("low", "medium", "high")
 
 
 def _ocr_available() -> bool:
@@ -92,32 +108,35 @@ def _trunc(s: str, n: int) -> str:
 # ── CLI runner ────────────────────────────────────────────────────────────────
 
 def _run(args: list, timeout: int = TIMEOUT_DEFAULT, cwd: str | None = None,
-         max_inline: int = MAX_INLINE_CHARS) -> dict:
+         max_inline: int = MAX_INLINE_CHARS, color: bool = True) -> dict:
     """Run ocr CLI and return compact result dict.
 
     max_inline: actions that must PARSE stdout as JSON (session_*, preview,
     rule) pass a large budget so the full output stays in `out` for parsing —
     the 9000-char default would truncate big listings and break json.loads.
+    color=False drops `--color never` (retry path for CLIs predating it).
     """
     if cwd and not os.path.isdir(cwd):
         return {"e": f"repo dir not found: {cwd}",
                 "h": "Pass an existing git repo root (or omit repo= for cwd)."}
+    argv = [OCR_BIN] + list(args)
+    if color:
+        argv += ["--color", "never"]
     try:
-        r = subprocess.run(
-            [OCR_BIN] + args,
-            capture_output=True, text=True, timeout=timeout,
-            cwd=cwd,
-        )
+        r = subprocess.run(argv, capture_output=True, text=True,
+                           timeout=timeout, cwd=cwd)
     except subprocess.TimeoutExpired:
-        return {"e": f"timeout ({timeout}s)", "h": "Increase timeout for large repos."}
+        return {"e": f"timeout ({timeout}s)", "h": "Increase timeout_mins / use resume."}
     except FileNotFoundError:
         return {"e": "ocr not found", "h": "Install: npm i -g @alibaba-group/open-code-review"}
     except Exception as e:
         return {"e": str(e)[:200]}
 
-    stdout = (r.stdout or "").strip()
     stderr = (r.stderr or "").strip()
+    if color and r.returncode != 0 and "unknown flag: --color" in stderr:
+        return _run(args, timeout=timeout, cwd=cwd, max_inline=max_inline, color=False)
 
+    stdout = (r.stdout or "").strip()
     result = {"ok": r.returncode == 0, "code": r.returncode}
 
     if stdout:
@@ -133,9 +152,9 @@ def _run(args: list, timeout: int = TIMEOUT_DEFAULT, cwd: str | None = None,
     return result
 
 
-def _save_output(text: str, tag: str) -> str:
+def _save_output(text: str, tag: str, suffix: str = ".txt") -> str:
     safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in tag)[:50]
-    path = _out_dir() / f"{safe}_{int(time.time())}.txt"
+    path = _out_dir() / f"{safe}_{int(time.time())}{suffix}"
     path.write_text(text, encoding="utf-8")
     return str(path)
 
@@ -167,7 +186,7 @@ def _attach_review_result(result: dict, compact_fn, tag: str) -> dict:
     if not compact:
         return result
     result["data"] = compact
-    result["@"] = _save_output(json.dumps(parsed, indent=2, default=str), tag)
+    result["@"] = _save_output(json.dumps(parsed, indent=2, default=str), tag, ".json")
     if not result.get("ok"):
         msg = (parsed.get("message") or "").strip()[:300]
         result["err"] = msg or result.get("err", "review failed (see data)")
@@ -175,10 +194,34 @@ def _attach_review_result(result: dict, compact_fn, tag: str) -> dict:
     return result
 
 
+def _resolve_output_file(fmt: str) -> str:
+    """v1.10+ `-o` target: our own temp path so stdout stays compact."""
+    return str(_out_dir() / f"ocr_{fmt}_{int(time.time() * 1000)}.{fmt}")
+
+
+def _read_output_file(path: str) -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+
+def _strip_progress(err: str) -> str:
+    """Drop OCR's `-o` status line ("[ocr] Results written to <path>") and
+    `--audience agent` progress chatter from `err` — they are not errors."""
+    if not err:
+        return ""
+    keep = [ln for ln in err.splitlines()
+            if "Results written to" not in ln
+            and not ln.strip().startswith("[ocr] ")]
+    return "\n".join(keep).strip()
+
+
 # ── Action handlers ───────────────────────────────────────────────────────────
 
 def _preview(from_ref: str, to_ref: str, commit: str, repo: str,
-             exclude: str, background: str, background_file: str) -> dict:
+             exclude: str, background: str, background_file: str,
+             rule_file: str, max_git_procs: int) -> dict:
     """ocr delegate preview --format json — deterministic file selection."""
     args = ["delegate", "preview", "--format", "json"]
     if from_ref:
@@ -195,6 +238,10 @@ def _preview(from_ref: str, to_ref: str, commit: str, repo: str,
         args += ["-b", background]
     if background_file:
         args += ["-B", background_file]
+    if rule_file:
+        args += ["--rule", rule_file]
+    if max_git_procs and max_git_procs > 0:
+        args += ["--max-git-procs", str(max_git_procs)]
 
     result = _run(args, cwd=repo if repo else None, max_inline=8_000_000)
     if result.get("ok"):
@@ -205,7 +252,8 @@ def _preview(from_ref: str, to_ref: str, commit: str, repo: str,
     return result
 
 
-def _rule(files: list, repo: str, rule_file: str) -> dict:
+def _rule(files: list, repo: str, rule_file: str, exclude: str,
+          commit: str, max_git_procs: int = 0) -> dict:
     """ocr delegate rule --format json — matched review rules grouped by content."""
     if not files:
         return {"e": "files required (list of repo-relative paths)"}
@@ -215,6 +263,12 @@ def _rule(files: list, repo: str, rule_file: str) -> dict:
         args += ["--repo", repo]
     if rule_file:
         args += ["--rule", rule_file]
+    if exclude:
+        args += ["--exclude", exclude]
+    if commit:
+        args += ["-c", commit]
+    if max_git_procs and max_git_procs > 0:
+        args += ["--max-git-procs", str(max_git_procs)]
 
     result = _run(args, cwd=repo if repo else None, max_inline=8_000_000)
     if result.get("ok"):
@@ -229,7 +283,7 @@ def _rule(files: list, repo: str, rule_file: str) -> dict:
             result["fs"] = files
             result["_action"] = "rule"
             if len(raw_out) > MAX_INLINE_CHARS:
-                result["@"] = _save_output(raw_out, "rule")
+                result["@"] = _save_output(raw_out, "rule", ".json")
                 result["out"] = raw_out[:2000] + \
                     f"... [{len(raw_out)} chars, full at @]"
         except (json.JSONDecodeError, TypeError):
@@ -265,121 +319,154 @@ def _rules_check(file_path: str, repo: str, rule_file: str) -> dict:
     return result
 
 
-def _review(from_ref: str, to_ref: str, commit: str, repo: str,
-            background: str, background_file: str, preview: bool,
-            concurrency: int, timeout_mins: int, rule_file: str,
-            resume: str, max_tokens_budget: int, no_filter: bool,
-            provider: str, model: str, fmt: str) -> dict:
+def _direct_args(mode: str, fmt: str) -> list:
+    return [mode, "--audience", "agent", "--format", fmt]
+
+
+def _review(kw: dict) -> dict:
     """ocr review — diff-based review (needs LLM unless preview=True)."""
+    preview = _bool(kw.get("preview", False))
     if not preview and not _ocr_llm_configured():
         return {"e": "LLM not configured on OCR side",
                 "h": "Use preview+rule delegation mode, or run: ocr config provider"}
 
-    fmt = (fmt or "json").lower()
-    if fmt not in ("json", "sarif", "text"):
-        return {"e": f"unsupported format '{fmt}'", "h": "Use json, sarif or text."}
-    if fmt == "sarif" and preview:
-        return {"e": "--format sarif is not supported with --preview",
-                "h": "SARIF requires a completed review; drop preview=True."}
+    fmt = (kw.get("format") or "json").lower()
+    bad = _check_format(fmt, preview)
+    if bad:
+        return bad
+    effort = (kw.get("effort") or "").lower()
+    if effort and effort not in _EFFORTS:
+        return {"e": f"unsupported effort '{effort}'", "h": "Use low, medium or high."}
 
-    args = ["review", "--audience", "agent", "--format", fmt]
-    if from_ref:
-        args += ["--from", from_ref]
-    if to_ref:
-        args += ["--to", to_ref]
-    if commit:
-        args += ["-c", commit]
-    if repo:
-        args += ["--repo", repo]
-    if background:
-        args += ["-b", background]
-    if background_file:
-        args += ["-B", background_file]
+    out_file = ""
+    args = _direct_args("review", fmt)
+    for key, flag in (("from_ref", "--from"), ("to_ref", "--to"),
+                      ("commit", "-c"), ("repo", "--repo"),
+                      ("background", "-b"), ("background_file", "-B"),
+                      ("rule_file", "--rule"), ("resume", "--resume"),
+                      ("provider", "--provider"), ("model", "--model")):
+        v = kw.get(key)
+        if v:
+            args += [flag, str(v)]
+    if kw.get("exclude"):
+        args += ["--exclude", str(kw["exclude"])]
     if preview:
         args += ["--preview"]
-    if concurrency and concurrency > 0:
-        args += ["--concurrency", str(concurrency)]
-    if timeout_mins and timeout_mins > 0:
-        args += ["--timeout", str(timeout_mins)]
-    if rule_file:
-        args += ["--rule", rule_file]
-    if resume:
-        args += ["--resume", resume]
-    if max_tokens_budget and max_tokens_budget > 0:
-        args += ["--max-tokens-budget", str(max_tokens_budget)]
-    if no_filter:
+    if effort:
+        args += ["--effort", effort]
+    for key, flag in (("concurrency", "--concurrency"), ("timeout_mins", "--timeout"),
+                      ("max_tokens_budget", "--max-tokens-budget"),
+                      ("max_tokens", "--max-tokens"), ("max_tools", "--max-tools"),
+                      ("max_git_procs", "--max-git-procs")):
+        n = _int(kw.get(key))
+        if n > 0:
+            args += [flag, str(n)]
+    if _bool(kw.get("no_filter", False)):
         args += ["--no-filter"]
-    if provider:
-        args += ["--provider", provider]
-    if model:
-        args += ["--model", model]
+    # v1.10+ --output: write the report to OUR file so stdout carries the
+    # summary lines and we can read back the (possibly large) payload.
+    if not preview and fmt in ("json", "sarif"):
+        out_file = _resolve_output_file(fmt)
+        args += ["-o", out_file]
 
     t = TIMEOUT_REVIEW if not preview else TIMEOUT_DEFAULT
-    result = _run(args, timeout=t, cwd=repo if repo else None)
+    result = _run(args, timeout=t, cwd=str(kw.get("repo") or "") or None)
+
+    if out_file:
+        payload = _read_output_file(out_file)
+        if payload.strip():
+            result["out"] = payload
+            result["result_file"] = out_file
+        else:
+            result.pop("out", None)
+        if result.get("err"):
+            cleaned = _strip_progress(result["err"])
+            if cleaned:
+                result["err"] = cleaned
+            else:
+                result.pop("err", None)
+
     if not preview and fmt == "json":
         _attach_review_result(result, _compact_review, "review")
     elif result.get("ok") and fmt == "sarif":
-        # SARIF is verbose JSON — always save to disk, inline summary
-        result["@"] = _save_output(result.get("out", ""), "review_sarif")
-        result["out"] = "SARIF report saved to @" + (
-            " | " + result["out"][:200] if result.get("out") else "")
+        result["@"] = _save_output(result.get("out", ""), "review_sarif", ".sarif")
+        result["out"] = "SARIF report saved to @"
     if result.get("ok") and not preview:
         result["_action"] = "review"
     return result
 
 
-def _scan(path: str, repo: str, preview: bool, background: str,
-          exclude: str, no_plan: bool, concurrency: int, timeout_mins: int,
-          resume: str, batch: str, no_summary: bool, no_dedup: bool,
-          max_tokens_budget: int, fmt: str) -> dict:
+def _scan(kw: dict) -> dict:
     """ocr scan — full-file scan (needs LLM unless preview=True)."""
+    preview = _bool(kw.get("preview", False))
     if not preview and not _ocr_llm_configured():
         return {"e": "LLM not configured on OCR side",
                 "h": "Use delegation mode, or run: ocr config provider"}
 
-    fmt = (fmt or "json").lower()
-    if fmt not in ("json", "sarif", "text"):
-        return {"e": f"unsupported format '{fmt}'", "h": "Use json, sarif or text."}
-    if fmt == "sarif" and preview:
-        return {"e": "--format sarif is not supported with --preview",
-                "h": "SARIF requires a completed scan; drop preview=True."}
+    fmt = (kw.get("format") or "json").lower()
+    bad = _check_format(fmt, preview)
+    if bad:
+        return bad
+    # `ocr scan` has no --effort in v1.12.x (review-only control) — reject
+    # explicitly rather than silently dropping the caller's intent.
+    if kw.get("effort"):
+        return {"e": "effort is review-only in OCR v1.12.x ('ocr scan' has no --effort)",
+                "h": "Use action='review' with effort, or tune scan via max_tokens/max_tools."}
+    batch = str(kw.get("batch") or "")
+    if batch and batch not in ("none", "by-language", "by-directory"):
+        return {"e": f"unsupported batch '{batch}'",
+                "h": "Use none, by-language or by-directory."}
 
-    args = ["scan", "--audience", "agent", "--format", fmt]
-    if path:
-        args += ["--path", path]
-    if repo:
-        args += ["--repo", repo]
-    if background:
-        args += ["-b", background]
-    if exclude:
-        args += ["--exclude", exclude]
+    out_file = ""
+    args = _direct_args("scan", fmt)
+    for key, flag in (("path", "--path"), ("repo", "--repo"),
+                      ("background", "-b"), ("exclude", "--exclude"),
+                      ("resume", "--resume"), ("provider", "--provider"),
+                      ("model", "--model"), ("rule_file", "--rule")):
+        v = kw.get(key)
+        if v:
+            args += [flag, str(v)]
     if preview:
         args += ["--preview"]
-    if no_plan:
-        args += ["--no-plan"]
-    if concurrency and concurrency > 0:
-        args += ["--concurrency", str(concurrency)]
-    if timeout_mins and timeout_mins > 0:
-        args += ["--timeout", str(timeout_mins)]
-    if resume:
-        args += ["--resume", resume]
     if batch:
         args += ["--batch", batch]
-    if no_summary:
-        args += ["--no-summary"]
-    if no_dedup:
-        args += ["--no-dedup"]
-    if max_tokens_budget and max_tokens_budget > 0:
-        args += ["--max-tokens-budget", str(max_tokens_budget)]
+    for key, flag in (("concurrency", "--concurrency"), ("timeout_mins", "--timeout"),
+                      ("max_tokens_budget", "--max-tokens-budget"),
+                      ("max_tokens", "--max-tokens"), ("max_tools", "--max-tools"),
+                      ("max_git_procs", "--max-git-procs")):
+        n = _int(kw.get(key))
+        if n > 0:
+            args += [flag, str(n)]
+    for key, flag in (("no_plan", "--no-plan"), ("no_summary", "--no-summary"),
+                      ("no_dedup", "--no-dedup")):
+        if _bool(kw.get(key, False)):
+            args += [flag]
+    if not preview and fmt in ("json", "sarif"):
+        out_file = _resolve_output_file(fmt)
+        args += ["-o", out_file]
 
     t = TIMEOUT_REVIEW if not preview else TIMEOUT_DEFAULT
-    result = _run(args, timeout=t, cwd=repo if repo else None)
+    result = _run(args, timeout=t, cwd=str(kw.get("repo") or "") or None)
+
+    if out_file:
+        payload = _read_output_file(out_file)
+        if payload.strip():
+            result["out"] = payload
+            result["result_file"] = out_file
+        else:
+            result.pop("out", None)
+        if result.get("err"):
+            cleaned = _strip_progress(result["err"])
+            if cleaned:
+                result["err"] = cleaned
+            else:
+                result.pop("err", None)
+
     if not preview and fmt == "json":
         _attach_review_result(result, _compact_review, "scan")
     elif result.get("ok") and fmt == "sarif":
-        result["@"] = _save_output(result.get("out", ""), "scan_sarif")
-        result["out"] = "SARIF report saved to @" + (
-            " | " + result["out"][:200] if result.get("out") else "")
+        result["@"] = _save_output(result.get("out", ""), "scan_sarif", ".sarif")
+        result["out"] = "SARIF report saved to @"
     if result.get("ok") and not preview:
         result["_action"] = "scan"
     return result
@@ -457,6 +544,101 @@ def _session_comments(session_id: str, repo: str, severity: str,
     return result
 
 
+def _session_compare(before: str, after: str, repo: str) -> dict:
+    """ocr session compare <before> <after> — new / persisting / resolved."""
+    if not before or not after:
+        return {"e": "before_id and after_id required (two session IDs)",
+                "h": "Use session_list to find IDs."}
+
+    args = ["session", "compare", before, after, "--json"]
+    if repo:
+        args += ["--repo", repo]
+
+    result = _run(args, cwd=repo if repo else None, max_inline=8_000_000)
+    if result.get("ok"):
+        _parse_json(result)
+        if "data" in result:
+            result["data"] = _compact_compare(result["data"], before, after)
+            result["_action"] = "session_compare"
+    return result
+
+
+def _viewer(addr: str, stop: bool, open_browser: bool) -> dict:
+    """Start/stop `ocr viewer` (session-history WebUI) detached."""
+    state_path = _out_dir() / "viewer.json"
+    addr = addr or "localhost:5483"
+    state = {}
+    if state_path.exists():
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception:
+            state = {}
+
+    running = False
+    pid = _int(state.get("pid"))
+    if pid > 0:
+        try:
+            os.kill(pid, 0)
+            running = True
+        except OSError:
+            running = False
+
+    if stop:
+        if not running:
+            return {"ok": True, "_action": "viewer_stop", "e": "no viewer running"}
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except Exception:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except Exception as e:
+                return {"e": f"kill failed: {e}"}
+        state_path.unlink(missing_ok=True)
+        return {"ok": True, "_action": "viewer_stop", "pid": pid}
+
+    if running:
+        return {"ok": True, "_action": "viewer", "url": state.get("url", ""),
+                "pid": pid, "already_running": True,
+                "log": state.get("log", "")}
+
+    url = f"http://{addr}"
+    log_path = _out_dir() / f"viewer_{int(time.time())}.log"
+    args = [OCR_BIN, "viewer", "--addr", addr,
+            "--open", "always" if open_browser else "never"]
+    try:
+        lf = open(log_path, "w", encoding="utf-8")
+        proc = subprocess.Popen(args, stdout=lf, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+    except Exception as e:
+        return {"e": f"viewer start failed: {e}"}
+
+    deadline = time.time() + 12
+    up = False
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            break
+        try:
+            with urllib.request.urlopen(url, timeout=1) as r:
+                up = r.status == 200
+                if up:
+                    break
+        except Exception:
+            time.sleep(0.5)
+    if not up:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        tail = _read_output_file(str(log_path))[-500:]
+        return {"e": "viewer did not become reachable", "url": url,
+                "log": str(log_path), "tail": tail}
+
+    state_path.write_text(json.dumps({"pid": proc.pid, "url": url,
+                                      "log": str(log_path)}), encoding="utf-8")
+    return {"ok": True, "_action": "viewer", "url": url, "pid": proc.pid,
+            "log": str(log_path)}
+
+
 def _llm_test() -> dict:
     result = _run(["llm", "test"])
     if result.get("ok"):
@@ -499,8 +681,35 @@ def _version() -> dict:
     if result.get("ok") and "out" in result:
         lines = result["out"].split("\n")
         result["version"] = lines[0] if lines else result["out"]
+        result["tool"] = TOOL_VERSION
         del result["out"]
     return result
+
+
+# ── Small helpers ─────────────────────────────────────────────────────────────
+
+def _bool(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "y", "on")
+    return bool(v)
+
+
+def _int(v) -> int:
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _check_format(fmt: str, preview: bool) -> dict | None:
+    if fmt not in ("json", "sarif", "text"):
+        return {"e": f"unsupported format '{fmt}'", "h": "Use json, sarif or text."}
+    if fmt == "sarif" and preview:
+        return {"e": "--format sarif is not supported with --preview",
+                "h": "SARIF requires a completed run; drop preview=True."}
+    return None
 
 
 # ── Compactors ────────────────────────────────────────────────────────────────
@@ -584,6 +793,8 @@ def _compact_review(d: dict) -> dict:
 
 
 def _compact_comment(c: dict) -> dict:
+    """Compact one finding. `thinking` (the model's private CoT) is dropped —
+    it can be tens of KB per comment and carries no review signal."""
     return {
         "f": c.get("path", ""),
         "l": [c.get("start_line", 0), c.get("end_line", 0)],
@@ -633,6 +844,32 @@ def _compact_session_view(d: dict) -> dict:
     return out
 
 
+def _compact_compare(d: dict, before: str, after: str) -> dict:
+    """session compare → counts + compact findings per bucket (thinking dropped)."""
+    def bucket(key: str, cap: int = 20) -> dict:
+        items = d.get(key) or []
+        b: dict = {"n": len(items)}
+        if items:
+            b["items"] = [_compact_comment(c) for c in items[:cap]]
+            if len(items) > cap:
+                b["more"] = len(items) - cap
+        return b
+
+    out = {
+        "before": (d.get("before") or {}).get("session_id", before),
+        "after": (d.get("after") or {}).get("session_id", after),
+        "before_mode": (d.get("before") or {}).get("review_mode", ""),
+        "after_mode": (d.get("after") or {}).get("review_mode", ""),
+        "new": bucket("new"),
+        "persisting": bucket("persisting"),
+        "resolved": bucket("resolved"),
+    }
+    # v1.10.2 also reports not-reviewed items when the coverage differs.
+    if d.get("not_reviewed") is not None:
+        out["not_reviewed"] = bucket("not_reviewed")
+    return out
+
+
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 
 _HANDLERS = {
@@ -640,37 +877,30 @@ _HANDLERS = {
         str(kw.get("from_ref", "")), str(kw.get("to_ref", "")),
         str(kw.get("commit", "")), str(kw.get("repo", "")),
         str(kw.get("exclude", "")), str(kw.get("background", "")),
-        str(kw.get("background_file", ""))),
+        str(kw.get("background_file", "")), str(kw.get("rule_file", "")),
+        _int(kw.get("max_git_procs"))),
     "rule": lambda kw: _rule(
         list(kw.get("files", []) or []), str(kw.get("repo", "")),
-        str(kw.get("rule_file", ""))),
+        str(kw.get("rule_file", "")), str(kw.get("exclude", "")),
+        str(kw.get("commit", "")), _int(kw.get("max_git_procs"))),
     "rules_check": lambda kw: _rules_check(
         str(kw.get("file", "")), str(kw.get("repo", "")),
         str(kw.get("rule_file", ""))),
-    "review": lambda kw: _review(
-        str(kw.get("from_ref", "")), str(kw.get("to_ref", "")),
-        str(kw.get("commit", "")), str(kw.get("repo", "")),
-        str(kw.get("background", "")), str(kw.get("background_file", "")),
-        bool(kw.get("preview", False)), int(kw.get("concurrency", 0) or 0),
-        int(kw.get("timeout_mins", 0) or 0), str(kw.get("rule_file", "")),
-        str(kw.get("resume", "")), int(kw.get("max_tokens_budget", 0) or 0),
-        bool(kw.get("no_filter", False)), str(kw.get("provider", "")),
-        str(kw.get("model", "")), str(kw.get("format", ""))),
-    "scan": lambda kw: _scan(
-        str(kw.get("path", "")), str(kw.get("repo", "")),
-        bool(kw.get("preview", False)), str(kw.get("background", "")),
-        str(kw.get("exclude", "")), bool(kw.get("no_plan", False)),
-        int(kw.get("concurrency", 0) or 0), int(kw.get("timeout_mins", 0) or 0),
-        str(kw.get("resume", "")), str(kw.get("batch", "")),
-        bool(kw.get("no_summary", False)), bool(kw.get("no_dedup", False)),
-        int(kw.get("max_tokens_budget", 0) or 0), str(kw.get("format", ""))),
+    "review": _review,
+    "scan": _scan,
     "session_list": lambda kw: _session_list(
-        str(kw.get("repo", "")), int(kw.get("limit", 0) or 0)),
+        str(kw.get("repo", "")), _int(kw.get("limit"))),
     "session_view": lambda kw: _session_view(
         str(kw.get("session_id", "")), str(kw.get("repo", ""))),
     "session_comments": lambda kw: _session_comments(
         str(kw.get("session_id", "")), str(kw.get("repo", "")),
         str(kw.get("severity", "")), str(kw.get("category", ""))),
+    "session_compare": lambda kw: _session_compare(
+        str(kw.get("before_id", "") or kw.get("session_id", "")),
+        str(kw.get("after_id", "")), str(kw.get("repo", ""))),
+    "viewer": lambda kw: _viewer(
+        str(kw.get("addr", "")), False, _bool(kw.get("open_browser", False))),
+    "viewer_stop": lambda kw: _viewer(str(kw.get("addr", "")), True, False),
     "llm_test": lambda kw: _llm_test(),
     "llm_providers": lambda kw: _llm_providers(),
     "version": lambda kw: _version(),
@@ -702,21 +932,23 @@ def ocr_tool(action: str, task_id: str = None, **kwargs) -> str:
 OCR_SCHEMA = {
     "name": "ocr",
     "description": (
-        "AI code review via alibaba/open-code-review v1.9+ CLI. DELEGATION "
+        "AI code review via alibaba/open-code-review v1.12+ CLI. DELEGATION "
         "(preview/rule/rules_check: no LLM needed) = deterministic file "
         "selection + rule resolution. DIRECT (review/scan: needs OCR LLM "
-        "config) = full AI review with line-level comments, json|sarif. "
-        "Utility: session_list/view/comments, llm_test, llm_providers, version."
+        "config) = full AI review with line-level comments, json|sarif, "
+        "effort, token budget. Utility: session_* (list/view/comments/"
+        "compare), llm_test, llm_providers, viewer, version."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "description": "preview|rule|rules_check: delegation (no LLM). review|scan: needs LLM (preview=True dry-runs). session_*|llm_*|version: utility.",
+                "description": "preview|rule|rules_check: delegation (no LLM). review|scan: needs LLM (preview=True dry-runs). session_*|llm_*|viewer|version: utility.",
                 "enum": ["preview", "rule", "rules_check", "review", "scan",
                          "session_list", "session_view", "session_comments",
-                         "llm_test", "llm_providers", "version"],
+                         "session_compare", "llm_test", "llm_providers",
+                         "viewer", "viewer_stop", "version"],
             },
             "files": {
                 "type": "array", "items": {"type": "string"},
@@ -728,7 +960,7 @@ OCR_SCHEMA = {
             },
             "from_ref": {"type": "string", "description": "Source ref (e.g. 'main') for preview/review."},
             "to_ref": {"type": "string", "description": "Target ref (e.g. 'feature') for preview/review."},
-            "commit": {"type": "string", "description": "Single commit hash (preview/review)."},
+            "commit": {"type": "string", "description": "Single commit hash (preview/review/rule)."},
             "repo": {"type": "string", "description": "Repo root directory (default: cwd)."},
             "path": {"type": "string", "description": "For 'scan': comma-sep dirs/files to scan."},
             "exclude": {"type": "string", "description": "Comma-sep gitignore-style patterns to exclude."},
@@ -736,11 +968,19 @@ OCR_SCHEMA = {
             "background_file": {"type": "string", "description": "Markdown file with business context."},
             "rule_file": {"type": "string", "description": "Custom rule.json path."},
             "preview": {"type": "boolean", "description": "Preview which files reviewed (no LLM call)."},
+            "effort": {"type": "string", "description": "review only: effort preset low|medium|high (default medium; scan rejects it)."},
             "no_plan": {"type": "boolean", "description": "For 'scan': skip per-file PLAN_TASK pre-pass."},
             "concurrency": {"type": "integer", "description": "Max concurrent file reviews (default: 8)."},
-            "timeout_mins": {"type": "integer", "description": "Per-file timeout in minutes (default: 10)."},
+            "timeout_mins": {"type": "integer", "description": "Concurrent task timeout in minutes (default: 15)."},
+            "max_git_procs": {"type": "integer", "description": "Max concurrent git subprocesses (default: 16)."},
+            "max_tokens": {"type": "integer", "description": "Per-group/per-file prompt token ceiling (0 = template default)."},
+            "max_tools": {"type": "integer", "description": "Max tool-call rounds per subtask (0 = template default; min 50)."},
             "limit": {"type": "integer", "description": "session_list: max sessions (default: 20)."},
-            "session_id": {"type": "string", "description": "Session ID for session_view/comments."},
+            "session_id": {"type": "string", "description": "Session ID for session_view/comments (or 'before' of session_compare)."},
+            "before_id": {"type": "string", "description": "session_compare: the earlier session ID."},
+            "after_id": {"type": "string", "description": "session_compare: the later session ID."},
+            "addr": {"type": "string", "description": "viewer: listen address (default localhost:5483)."},
+            "open_browser": {"type": "boolean", "description": "viewer: also open the system browser (default false)."},
             "resume": {"type": "string", "description": "Resume review/scan from a previous session ID."},
             "max_tokens_budget": {"type": "integer", "description": "Cap total tokens (input+output); stops dispatch when exceeded."},
             "no_filter": {"type": "boolean", "description": "review: keep all comments without LLM post-filtering."},
@@ -776,11 +1016,19 @@ registry.register(
         background_file=args.get("background_file", ""),
         rule_file=args.get("rule_file", ""),
         preview=args.get("preview", False),
+        effort=args.get("effort", ""),
         no_plan=args.get("no_plan", False),
         concurrency=args.get("concurrency", 0),
         timeout_mins=args.get("timeout_mins", 0),
+        max_git_procs=args.get("max_git_procs", 0),
+        max_tokens=args.get("max_tokens", 0),
+        max_tools=args.get("max_tools", 0),
         limit=args.get("limit", 0),
         session_id=args.get("session_id", ""),
+        before_id=args.get("before_id", ""),
+        after_id=args.get("after_id", ""),
+        addr=args.get("addr", ""),
+        open_browser=args.get("open_browser", False),
         resume=args.get("resume", ""),
         max_tokens_budget=args.get("max_tokens_budget", 0),
         no_filter=args.get("no_filter", False),

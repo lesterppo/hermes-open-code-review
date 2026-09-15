@@ -3,7 +3,7 @@
 [![GitHub stars](https://img.shields.io/github/stars/lesterppo/hermes-open-code-review?style=flat-square)](https://github.com/lesterppo/hermes-open-code-review/stargazers)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](https://github.com/lesterppo/hermes-open-code-review/blob/main/LICENSE)
 [![Hermes Agent](https://img.shields.io/badge/Hermes_Agent-native_tool-8A2BE2?style=flat-square)](https://github.com/NousResearch/hermes-agent)
-[![OCR version](https://img.shields.io/badge/OCR-v1.9%2B-green?style=flat-square)](https://github.com/alibaba/open-code-review)
+[![OCR version](https://img.shields.io/badge/OCR-v1.12%2B-green?style=flat-square)](https://github.com/alibaba/open-code-review)
 
 **AI-powered automated code review** for [Hermes Agent](https://github.com/NousResearch/hermes-agent), integrating Alibaba's [Open Code Review](https://github.com/alibaba/open-code-review) (OCR) as a native, token-efficient tool.
 
@@ -11,18 +11,18 @@
 
 ## Why Use This?
 
-- **Three mode groups** — Delegation (`preview`/`rule`/`rules_check`: no OCR LLM needed, always works), Direct (`review`/`scan`: full AI pipeline with line-level comments, json or SARIF), and Utility (sessions, LLM checks)
-- **v1.9.6 CLI support** — JSON delegation output, SARIF 2.1.0, `--resume`, `--max-tokens-budget`, `--no-filter`, `--batch`, `--no-summary`, `session comments`, `rules check`, `llm providers`
-- **Token-efficient** — Compact JSON with 1-2 char keys, big results saved to disk (`@`), token budgets surfaced (`data.budget` + warnings on budget-stop)
+- **Three mode groups** — Delegation (`preview`/`rule`/`rules_check`: no OCR LLM needed, always works), Direct (`review`/`scan`: full AI pipeline with line-level comments, json or SARIF), and Utility (session forensics, session compare, WebUI viewer, LLM checks)
+- **v1.12.x CLI support** — `--effort low|medium|high`, `--max-tokens`, `--max-tools`, `--max-git-procs`, `--output`, `session compare` (new/persisting/resolved across runs), `ocr viewer` WebUI, `--audience agent` (summary-only output)
+- **Token-efficient** — Compact JSON with 1-2 char keys; the model's private `thinking` traces (tens of KB per finding) are stripped; big results saved to disk (`@`); reports routed through `-o` and re-read so stdout stays small
 - **Deterministic + AI hybrid** — OCR handles file selection and rule matching deterministically; the review itself uses AI
 - **Built-in security rules** — SQL injection, XSS, hardcoded secrets, weak cryptography, shell injection, and more
-- **Multi-language** — Python, JavaScript/TypeScript, Java, Go, Rust, C/C++, Swift, R, Zig, Nim, Haskell, Elm, Jsonnet + more (v1.9.x added `.ipynb`, Thrift, Cap'n Proto, Nix)
+- **Multi-language** — Python, JavaScript/TypeScript, Java, Go, Rust, C/C++, Swift, R, Objective-C, Ruby, PHP, Kotlin, Scala, SQL, Zig, Nim, Haskell, Elm, OCaml/ReasonML, Jsonnet, Nix, Thrift, Cap'n Proto, Solidity, Vyper, Rego, Verilog/SystemVerilog/VHDL, MATLAB, Handlebars/Mustache, Pug, `.ipynb` and more
 - **Zero LLM config for delegation** — OCR provides file lists and review rules; your Hermes agent does the review
 
 ## Quick Start
 
 ```bash
-# 1. Install OCR CLI (one-time)
+# 1. Install OCR CLI (one-time) — v1.12.2 or newer
 npm install -g @alibaba-group/open-code-review
 
 # 2. Install the Hermes native tool (installs into the local-tools plugin —
@@ -64,8 +64,14 @@ Requires OCR LLM configured (`ocr config set provider deepseek && ocr config set
 # Diff-based review (branch comparison) — json output
 ocr(action='review', from_ref='main', to_ref='feature-branch')
 
+# Review effort preset (review-only in v1.12.x)
+ocr(action='review', from_ref='main', to_ref='feature-branch', effort='high')
+
 # Full-file scan (no diff needed — audit unfamiliar code)
 ocr(action='scan', path='internal/agent')
+
+# Tune prompt / tool-round ceilings per group or file
+ocr(action='scan', path='internal/agent', max_tokens=6000, max_tools=60)
 
 # SARIF 2.1.0 report (saved to disk, `@` key)
 ocr(action='review', from_ref='main', to_ref='feature-branch', format='sarif')
@@ -83,6 +89,13 @@ ocr(action='scan', path='internal/agent', max_tokens_budget=200000)
 ocr(action='session_list')
 ocr(action='session_view', session_id='<id>')
 ocr(action='session_comments', session_id='<id>', severity='critical,high')
+
+# Did the last round of fixes actually fix anything? (new / persisting / resolved)
+ocr(action='session_compare', before_id='<older-id>', after_id='<newer-id>')
+
+# Browse session history in the WebUI (starts detached, returns the URL)
+ocr(action='viewer')
+ocr(action='viewer_stop')
 ```
 
 OCR returns structured JSON with line-level comments: severity, category, exact line ranges, fix suggestions, and existing code.
@@ -94,13 +107,16 @@ OCR returns structured JSON with line-level comments: severity, category, exact 
 | `preview` | Delegation | Which files to review + mode/ref/merge_base metadata (JSON) |
 | `rule` | Delegation | Matched review rules grouped by content (full text + compact groups) |
 | `rules_check` | Delegation | Which rule applies to a given file path |
-| `review` | Direct | Diff-based AI review (json \| sarif, resume, token budget) |
+| `review` | Direct | Diff-based AI review (json \| sarif, effort, resume, token budget) |
 | `scan` | Direct | Full-file AI scan (json \| sarif, batch, resume, no-diff) |
 | `session_list` | Utility | List saved review sessions (compact) |
 | `session_view` | Utility | Inspect a session (files + comment counts) |
 | `session_comments` | Utility | Extract comments from a session (severity/category filters) |
+| `session_compare` | Utility | Diff two sessions: new / persisting / resolved findings |
 | `llm_test` | Utility | Live OCR LLM connectivity check |
 | `llm_providers` | Utility | List built-in LLM providers (25+) |
+| `viewer` | Utility | Start the local session-history WebUI (detached, returns URL) |
+| `viewer_stop` | Utility | Stop a viewer started by this tool |
 | `version` | Utility | Show OCR CLI version |
 
 ## What OCR Detects
@@ -117,8 +133,9 @@ OCR's built-in deterministic rules cover:
 ## Repository Structure
 
 ```
-tools/ocr_tool.py # Native Hermes tool v2 (registry.register + dispatch)
-skills/ocr-code-review/SKILL.md # Hermes skill v2.0.0 with full delegation workflow
+tools/ocr_tool.py # Native Hermes tool v3 (registry.register + dispatch)
+skills/ocr-code-review/SKILL.md # Hermes skill v3.0.0 with full delegation workflow
+scripts/flag_audit.py # Cross-checks every emitted flag against `ocr <cmd> --help`
 install.sh # Installs tool + skill into ~/.hermes/plugins/hermes_local_tools/
 AGENTS.md # AI agent discoverability instructions
 ```
@@ -126,6 +143,21 @@ AGENTS.md # AI agent discoverability instructions
 The runtime copy lives in `~/.hermes/plugins/hermes_local_tools/ocr_tool.py`
 (the local-tools plugin — survives `hermes update`). The repo `tools/` copy is
 canonical; keep both in sync (`cp tools/ocr_tool.py ~/.hermes/plugins/hermes_local_tools/`).
+
+## Compatibility notes
+
+- `--effort` exists on `ocr review` only (v1.12.x). The tool rejects `effort`
+  on `scan` with a hint instead of silently dropping it.
+- `--color never` is injected into every call so stdout stays ANSI-free; the
+  runner auto-retries without it on CLI versions that predate the flag.
+- SARIF is not allowed with `preview=True` (upstream constraint, surfaced as a
+  clear error).
+- A token-budget stop publishes partial results and exits 0 in v1.12
+  (non-zero only when every item failed). The tool reports the stop as
+  `data.budget` + `data.warns` regardless of exit code.
+- `ocr`'s `[ocr] Results written to <file>` status line is filtered out of
+  `err`, so a successful run never looks like a failure.
+- Workspace resume is unsupported upstream — `resume` needs a range or commit.
 
 ## Project Context
 
