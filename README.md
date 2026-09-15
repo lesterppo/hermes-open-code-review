@@ -136,6 +136,7 @@ OCR's built-in deterministic rules cover:
 tools/ocr_tool.py # Native Hermes tool v3 (registry.register + dispatch)
 skills/ocr-code-review/SKILL.md # Hermes skill v3.0.0 with full delegation workflow
 scripts/flag_audit.py # Cross-checks every emitted flag against `ocr <cmd> --help`
+tests/test_ocr_tool.py # 11 offline regression tests (stdlib runner, no LLM)
 install.sh # Installs tool + skill into ~/.hermes/plugins/hermes_local_tools/
 AGENTS.md # AI agent discoverability instructions
 ```
@@ -158,6 +159,18 @@ canonical; keep both in sync (`cp tools/ocr_tool.py ~/.hermes/plugins/hermes_loc
 - `ocr`'s `[ocr] Results written to <file>` status line is filtered out of
   `err`, so a successful run never looks like a failure.
 - Workspace resume is unsupported upstream — `resume` needs a range or commit.
+
+## Development
+
+```bash
+python3 tests/test_ocr_tool.py     # 11 offline tests (no LLM, no network)
+python3 scripts/flag_audit.py      # verify emitted flags vs the installed CLI
+```
+
+The tool was dogfooded against itself (CLI v1.12.2): a scan of
+`tools/ocr_tool.py` found 5 issues, 4 of them real and fixed in v3.0.1 (lost
+diagnostics when the CLI writes no `-o` report, a viewer fd leak, a
+char-by-char `files` iteration on bare strings, and an unguarded viewer kill).
 
 ## Project Context
 

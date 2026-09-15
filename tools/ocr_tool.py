@@ -58,7 +58,7 @@ MAX_INLINE_CHARS = 9000
 OCR_BIN = shutil.which("ocr") or "ocr"
 TIMEOUT_REVIEW = 1800   # 30 min for review/scan (LLM runs)
 TIMEOUT_DEFAULT = 60
-TOOL_VERSION = "3.0.0"
+TOOL_VERSION = "3.0.1"
 OCR_CONFIG = Path.home() / ".opencodereview" / "config.json"
 _LLM_GATE_CACHE = {"mtime": 0.0, "ok": False}
 _EFFORTS = ("low", "medium", "high")
@@ -204,6 +204,30 @@ def _read_output_file(path: str) -> str:
         return Path(path).read_text(encoding="utf-8")
     except Exception:
         return ""
+
+
+def _apply_output_file(result: dict, out_file: str, tag: str) -> None:
+    """Fold an `-o <file>` report back into the result.
+
+    The CLI writes the report to OUR file and prints only summary/progress
+    lines to stdout. If it wrote nothing (failure before dispatch, aborted
+    run, older build), keep meaningful stdout instead of discarding the only
+    diagnostics we have.
+    """
+    payload = _read_output_file(out_file)
+    if payload.strip():
+        result["out"] = payload
+        result["result_file"] = out_file
+    else:
+        result["note"] = "CLI wrote no report file (see err/out for the reason)"
+        stdout = result.get("out") or ""
+        if len(stdout) < 120:          # progress chatter only — drop it
+            result.pop("out", None)
+    cleaned = _strip_progress(result.get("err") or "")
+    if cleaned:
+        result["err"] = cleaned
+    else:
+        result.pop("err", None)
 
 
 def _strip_progress(err: str) -> str:
@@ -373,18 +397,7 @@ def _review(kw: dict) -> dict:
     result = _run(args, timeout=t, cwd=str(kw.get("repo") or "") or None)
 
     if out_file:
-        payload = _read_output_file(out_file)
-        if payload.strip():
-            result["out"] = payload
-            result["result_file"] = out_file
-        else:
-            result.pop("out", None)
-        if result.get("err"):
-            cleaned = _strip_progress(result["err"])
-            if cleaned:
-                result["err"] = cleaned
-            else:
-                result.pop("err", None)
+        _apply_output_file(result, out_file, "review")
 
     if not preview and fmt == "json":
         _attach_review_result(result, _compact_review, "review")
@@ -449,18 +462,7 @@ def _scan(kw: dict) -> dict:
     result = _run(args, timeout=t, cwd=str(kw.get("repo") or "") or None)
 
     if out_file:
-        payload = _read_output_file(out_file)
-        if payload.strip():
-            result["out"] = payload
-            result["result_file"] = out_file
-        else:
-            result.pop("out", None)
-        if result.get("err"):
-            cleaned = _strip_progress(result["err"])
-            if cleaned:
-                result["err"] = cleaned
-            else:
-                result.pop("err", None)
+        _apply_output_file(result, out_file, "scan")
 
     if not preview and fmt == "json":
         _attach_review_result(result, _compact_review, "scan")
@@ -563,6 +565,18 @@ def _session_compare(before: str, after: str, repo: str) -> dict:
     return result
 
 
+def _is_ocr_viewer(pid: int) -> bool:
+    """Guard before signalling: the state file could be stale and the pid
+    recycled by an unrelated process. Only kill something that IS `ocr viewer`."""
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\x00", b" ")
+        text = cmdline.decode("utf-8", "replace")
+    except Exception:
+        return False
+    low = text.lower()
+    return "ocr" in low and "viewer" in low
+
+
 def _viewer(addr: str, stop: bool, open_browser: bool) -> dict:
     """Start/stop `ocr viewer` (session-history WebUI) detached."""
     state_path = _out_dir() / "viewer.json"
@@ -586,6 +600,10 @@ def _viewer(addr: str, stop: bool, open_browser: bool) -> dict:
     if stop:
         if not running:
             return {"ok": True, "_action": "viewer_stop", "e": "no viewer running"}
+        if not _is_ocr_viewer(pid):
+            state_path.unlink(missing_ok=True)
+            return {"ok": True, "_action": "viewer_stop", "stale": True,
+                    "e": f"pid {pid} is not an ocr viewer; state cleared"}
         try:
             os.killpg(os.getpgid(pid), signal.SIGTERM)
         except Exception:
@@ -606,9 +624,11 @@ def _viewer(addr: str, stop: bool, open_browser: bool) -> dict:
     args = [OCR_BIN, "viewer", "--addr", addr,
             "--open", "always" if open_browser else "never"]
     try:
-        lf = open(log_path, "w", encoding="utf-8")
-        proc = subprocess.Popen(args, stdout=lf, stderr=subprocess.STDOUT,
-                                start_new_session=True)
+        # The child inherits the fd; the parent must close its own handle or
+        # every viewer start leaks a descriptor.
+        with open(log_path, "w", encoding="utf-8") as lf:
+            proc = subprocess.Popen(args, stdout=lf, stderr=subprocess.STDOUT,
+                                    start_new_session=True)
     except Exception as e:
         return {"e": f"viewer start failed: {e}"}
 
@@ -694,6 +714,21 @@ def _bool(v) -> bool:
     if isinstance(v, str):
         return v.strip().lower() in ("1", "true", "yes", "y", "on")
     return bool(v)
+
+
+def _file_list(v) -> list:
+    """Accept a list of paths, a comma-separated string, or a single path.
+    A bare string must NOT be iterated char-by-char (['a','.','p','y'])."""
+    if not v:
+        return []
+    if isinstance(v, str):
+        return [p.strip() for p in v.split(",") if p.strip()]
+    if isinstance(v, (list, tuple)):
+        out = []
+        for item in v:
+            out.extend(_file_list(item) if "," in str(item) else [str(item).strip()])
+        return [p for p in out if p]
+    return [str(v)]
 
 
 def _int(v) -> int:
@@ -880,7 +915,7 @@ _HANDLERS = {
         str(kw.get("background_file", "")), str(kw.get("rule_file", "")),
         _int(kw.get("max_git_procs"))),
     "rule": lambda kw: _rule(
-        list(kw.get("files", []) or []), str(kw.get("repo", "")),
+        _file_list(kw.get("files")), str(kw.get("repo", "")),
         str(kw.get("rule_file", "")), str(kw.get("exclude", "")),
         str(kw.get("commit", "")), _int(kw.get("max_git_procs"))),
     "rules_check": lambda kw: _rules_check(
@@ -923,7 +958,12 @@ def ocr_tool(action: str, task_id: str = None, **kwargs) -> str:
         return json.dumps({"e": f"unknown action '{action}'",
                            "actions": sorted(_HANDLERS.keys())})
 
-    result = fn(kwargs)
+    try:
+        result = fn(kwargs)
+    except Exception as e:  # noqa: BLE001 — a tool must always answer in JSON
+        result = {"ok": False, "e": f"internal error: {type(e).__name__}: {e}",
+                  "h": "Report this with the action + params; the tool must never raise."}
+        result["_action"] = action
     return json.dumps(result, indent=2, default=str)
 
 

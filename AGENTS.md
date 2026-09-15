@@ -355,6 +355,35 @@ exercised end-to-end against the real CLI + DeepSeek V4 Flash:
 Payload sizes confirm the token economy: review 2.4KB, scan 3.7KB, preview
 0.2-0.4KB, session_compare 2.8KB, schema 8.3KB.
 
+### Dogfood: scanned the tool with itself (CLI v1.12.2, DeepSeek V4 Flash)
+
+`ocr scan --path tools/ocr_tool.py` (102s, 130k tokens, 5 findings) — the tool
+reviewed its own source. Four were real and are fixed in v3.0.1:
+
+| Finding | Sev | Fix |
+|---------|-----|-----|
+| `-o` set but CLI wrote no report file → `out` popped, diagnostics lost | high | `_apply_output_file()` keeps meaningful stdout + sets `note` |
+| viewer log handle `lf` never closed → fd leak per start | medium | `with open(...)` around `Popen` |
+| `kw.get("files")` iterated char-by-char when a bare string is passed | medium | `_file_list()` accepts list / CSV string / single path |
+| handler exception escapes as a traceback instead of JSON | low | dispatch wraps handlers → `{ok:false, e:"internal error: …"}` |
+| `viewer_stop` signals a state-file PID without verifying it is ours | low | `_is_ocr_viewer()` reads `/proc/<pid>/cmdline` and refuses (clears stale state) |
+
+Behaviour verified after the fixes: review/scan unchanged (4 findings each, no
+stderr noise), bad `resume` returns a clear error + `note`, viewer start/HTTP
+200/stop/idempotent-stop all good.
+
+### Regression tests
+
+`tests/test_ocr_tool.py` — stdlib runner (`python3 tests/test_ocr_tool.py`,
+also pytest-compatible), 11 tests / all pass, no LLM or network:
+
+- argument construction for review/scan/preview/rule/session_compare
+  (including "scan must NOT receive --effort")
+- validation errors (bad effort/batch/format, sarif+preview, missing ids)
+- garbage inputs never crash (`concurrency="abc"`, `max_tokens=-5`, huge limit)
+- `_file_list` coercion (`"a.py"` stays one path)
+- compactors drop `thinking`; schema enum == handler set; schema < 6k chars
+
 ## Development
 
 - Canonical tool: `tools/ocr_tool.py` (v3, ~870 lines, Python stdlib only)
