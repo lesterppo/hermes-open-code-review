@@ -6,7 +6,7 @@ compatibility: Requires `ocr` CLI v1.12+ installed. Uses native Hermes `ocr` too
 metadata:
   author: Peter/lesterppo
   homepage: https://github.com/lesterppo/hermes-open-code-review
-  version: "3.0.0"
+  version: "3.0.1"
 ---
 
 # OCR Code Review (Hermes-native)
@@ -184,7 +184,7 @@ version           — show OCR CLI version
 - Tool source: https://github.com/lesterppo/hermes-open-code-review
 - Upstream OCR: https://github.com/alibaba/open-code-review (v1.12.2+)
 - OCR docs: https://open-codereview.ai/docs
-- Hermes skill: `ocr-code-review` (v3.0.0)
+- Hermes skill: `ocr-code-review` (v3.0.1)
 - Runtime copy: `~/.hermes/plugins/hermes_local_tools/ocr_tool.py` (plugin —
   survives `hermes update`; toolset `code_review` auto-enables). Repo `tools/`
   copy is canonical; sync edits to the plugin via `cp`.
@@ -230,6 +230,12 @@ version           — show OCR CLI version
   (src/url/model) are parsed
 - **Save full results to disk** — `@` key for file path when output exceeds
   9000 chars (and always for review/scan/sarif/session outputs)
+- **`files` accepts a list, a CSV string, or one path** — a bare string used to
+  be iterated char-by-char (`"a.py"` → `['a','.','p','y']`); the tool now
+  coerces via `_file_list()`
+- **Handlers never raise** — an unexpected exception returns
+  `{ok:false, e:"internal error: …"}` so a review run cannot break the turn
+- **`-o` report missing** → `data.note` is set and meaningful stdout is kept
 - **viewer binds localhost:5483** — the tool starts it detached and returns the
   URL; a stale viewer holding the port makes a fresh start fail cleanly (stop
   it first with `viewer_stop`)
